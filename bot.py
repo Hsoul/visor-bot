@@ -1,12 +1,12 @@
 import os
+import io
 import sys
 import time
 import subprocess
 
-# --- БРОНЕБОЙНЫЙ БЛОК: Принудительная установка библиотек ---
-# Если Amvera закэшировала старую сборку, скрипт установит всё сам
+# --- Авто-установка зависимостей ---
 def install_dependencies():
-    print("Внимание: Библиотеки не найдены. Принудительная установка...")
+    print("Установка необходимых библиотек...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyTelegramBotAPI", "pillow", "google-generativeai"])
 
 try:
@@ -18,20 +18,33 @@ except ImportError:
     import telebot
     import google.generativeai as genai
     from PIL import Image
-# -------------------------------------------------------------
+# -----------------------------------
 
-# 1. Получение ключей
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise ValueError("Критическая ошибка: Не найдены ключи в переменных окружения.")
 
-# 2. Настройка Gemini API (стабильная модель)
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
 
-# 3. Инициализация Telegram бота
+# Автоматический выбор доступной модели от Google
+def get_working_model():
+    try:
+        available_models = list(genai.list_models())
+        # 1. Ищем рабочую модель Flash
+        for m in available_models:
+            if 'generateContent' in m.supported_generation_methods and 'flash' in m.name.lower():
+                return genai.GenerativeModel(m.name)
+        # 2. Если Flash не найдена, берём любую поддерживающую генерацию
+        for m in available_models:
+            if 'generateContent' in m.supported_generation_methods:
+                return genai.GenerativeModel(m.name)
+    except Exception as e:
+        print(f"Ошибка получения списка моделей: {e}")
+    
+    return genai.GenerativeModel('models/gemini-1.5-flash')
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 SYSTEM_PROMPT = """
@@ -58,20 +71,16 @@ def handle_photo(message):
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
-        # Запись во временный файл для надежности
-        temp_path = "temp_card.jpg"
-        with open(temp_path, 'wb') as new_file:
-            new_file.write(downloaded_file)
-            
-        image = Image.open(temp_path)
+        image = Image.open(io.BytesIO(downloaded_file))
+        
+        # Динамически получаем доступную модель
+        model = get_working_model()
         response = model.generate_content([SYSTEM_PROMPT, image])
         
         if response.text:
             bot.reply_to(message, response.text)
         else:
             bot.reply_to(message, "Не удалось прочитать данные с визитки.")
-            
-        os.remove(temp_path) # Убираем за собой
             
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка обработки: {e}")

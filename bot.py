@@ -11,9 +11,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GEMINI_API_KEY в переменных окружения.")
 
-# Настройка Gemini API
+# Настройка Gemini API (используем актуальную модель gemini-1.5-flash)
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3.8-flash')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # Инициализация Telegram бота
 bot = telebot.TeleBot(TELEGRAM_TOKEN)

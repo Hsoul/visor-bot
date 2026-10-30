@@ -28,22 +28,8 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Автоматический выбор доступной модели от Google
-def get_working_model():
-    try:
-        available_models = list(genai.list_models())
-        # 1. Ищем рабочую модель Flash
-        for m in available_models:
-            if 'generateContent' in m.supported_generation_methods and 'flash' in m.name.lower():
-                return genai.GenerativeModel(m.name)
-        # 2. Если Flash не найдена, берём любую поддерживающую генерацию
-        for m in available_models:
-            if 'generateContent' in m.supported_generation_methods:
-                return genai.GenerativeModel(m.name)
-    except Exception as e:
-        print(f"Ошибка получения списка моделей: {e}")
-    
-    return genai.GenerativeModel('models/gemini-1.5-flash')
+# Жестко задаем требуемую сервером модель
+model = genai.GenerativeModel('gemini-3.8-flash')
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -73,8 +59,6 @@ def handle_photo(message):
         
         image = Image.open(io.BytesIO(downloaded_file))
         
-        # Динамически получаем доступную модель
-        model = get_working_model()
         response = model.generate_content([SYSTEM_PROMPT, image])
         
         if response.text:

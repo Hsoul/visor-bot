@@ -1,21 +1,22 @@
 import os
 import io
+import time
 import telebot
 from PIL import Image
 import google.generativeai as genai
 
-# Получение ключей из переменных окружения
+# 1. Получение ключей из переменных окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("Не найдены TELEGRAM_TOKEN или GEMINI_API_KEY в переменных окружения.")
+    raise ValueError("Критическая ошибка: Не найдены TELEGRAM_TOKEN или GEMINI_API_KEY.")
 
-# Настройка Gemini API (используем актуальную модель gemini-1.5-flash)
+# 2. Настройка Gemini API (стабильная модель 1.5-flash)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Инициализация Telegram бота
+# 3. Инициализация Telegram бота
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 SYSTEM_PROMPT = """
@@ -39,14 +40,10 @@ def handle_photo(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
         
-        # Получаем файл с наивысшим разрешением
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
-        # Открываем изображение для Gemini
         image = Image.open(io.BytesIO(downloaded_file))
-        
-        # Генерация ответа
         response = model.generate_content([SYSTEM_PROMPT, image])
         
         if response.text:
@@ -58,5 +55,11 @@ def handle_photo(message):
         bot.reply_to(message, f"❌ Ошибка обработки: {e}")
 
 if __name__ == '__main__':
-    print("Бот успешно запущен и ожидает сообщений...")
-    bot.polling(none_stop=True)
+    print("Бот запускается...")
+    # Бронебойный цикл защиты от падения при облачных перезапусках
+    while True:
+        try:
+            bot.polling(none_stop=True)
+        except Exception as e:
+            print(f"Сбой соединения с Telegram: {e}. Перезапуск через 5 секунд...")
+            time.sleep(5)

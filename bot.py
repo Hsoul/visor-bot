@@ -43,7 +43,7 @@ def load_and_fix_orientation(image_bytes: bytes) -> Image.Image:
 
 
 def convert_image_to_jpeg_bytes(image_bytes: bytes) -> bytes:
-  """Конвертирует входное фото в стандартные байты JPEG с учетом поворота."""
+  """Конвертирует входное фото в стандартные байты JPEG с учетом автоповорота."""
   img = load_and_fix_orientation(image_bytes)
   output_buffer = io.BytesIO()
   img.save(output_buffer, format="JPEG", quality=95)
@@ -53,7 +53,7 @@ def convert_image_to_jpeg_bytes(image_bytes: bytes) -> bytes:
 def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
   """Вырезает логотип по координатам bbox [ymin, xmin, ymax, xmax] (0..1000)
 
-  с учетом EXIF-ориентации и небольшим запасом.
+  с проверкой корректности границ.
   """
   if not bbox or len(bbox) != 4:
     return ""
@@ -62,14 +62,9 @@ def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
     w, h = img.size
     ymin, xmin, ymax, xmax = bbox
 
-    # Добавляем 5% запаса (padding) вокруг логотипа, чтобы не резать впритык
-    pad_h = int((ymax - ymin) * 0.05)
-    pad_w = int((xmax - xmin) * 0.05)
-
-    ymin = max(0, ymin - pad_h)
-    xmin = max(0, xmin - pad_w)
-    ymax = min(1000, ymax + pad_h)
-    xmax = min(1000, xmax + pad_w)
+    # Защита от сбоев: если рамка уходит в край кадра (стол) или некорректна
+    if ymax <= ymin or xmax <= xmin:
+      return ""
 
     # Перевод координат 0..1000 в реальные пиксели
     left = max(0, int(xmin * w / 1000))
@@ -77,11 +72,14 @@ def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
     right = min(w, int(xmax * w / 1000))
     bottom = min(h, int(ymax * h / 1000))
 
-    if right <= left or bottom <= top:
+    crop_w = right - left
+    crop_h = bottom - top
+
+    # Если вырезанный фрагмент слишком маленький или узкий — пропускаем
+    if crop_w < 20 or crop_h < 20:
       return ""
 
     cropped = img.crop((left, top, right, bottom))
-    # Оптимизируем размер аватарки
     cropped.thumbnail((400, 400))
 
     buf = io.BytesIO()
@@ -142,15 +140,14 @@ def generate_vcard(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
-      "Привет, Владимир! Отправь мне фотографию визитки. Я создам контакт .vcf"
-      " с верным логотипом и заметками!"
+      "Привет, Владимир! Отправь мне фотографию визитки. Я сформирую файл"
+      " контакта .vcf для iPhone!"
   )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   status_msg = await update.message.reply_text(
-      "Распознаю визитку, определяю профильный логотип и создаю файл"
-      " контакта..."
+      "Распознаю визитку и создаю файл контакта..."
   )
 
   try:
@@ -167,16 +164,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_file = await context.bot.get_file(file_id)
     raw_bytes = await telegram_file.download_as_bytearray()
 
-    # Поворачиваем изображение по EXIF и переводим в JPEG
     jpeg_bytes = convert_image_to_jpeg_bytes(bytes(raw_bytes))
     base64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
 
     prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
 ПРАВИЛА ОПРЕДЕЛЕНИЯ ЛОГОТИПА (logo_bbox):
-1. ИГНОРИРУЙ QR-КОДЫ И ШТРИХ-КОДЫ.
-2. Если на визитке есть общая символика (например, Герб города/субъекта слева) и профильная эмблема службы/ведомства/компании (например, Эмблема Гостехнадзора справа), выбери ПРОФИЛЬНУЮ ЭМБЛЕМУ ВЕДОМСТВА/КОМПАНИИ.
-3. Верни рамку выбранной эмблемы [ymin, xmin, ymax, xmax] по шкале 0..1000 строго вокруг самой эмблемы.
+1. ИГНОРИРУЙ СТОЛ, ФОН И КРАЯ САМОЙ БУМАЖНОЙ ВИЗИТКИ. Ищи эмблему ТОЛЬКО внутри напечатанного поля визитки.
+2. ИГНОРИРУЙ QR-КОДЫ И ШТРИХ-КОДЫ.
+3. Если есть герб региона/города и профильная эмблема ведомства/компании — выбери профильную эмблему ведомства/компании.
+4. Укажи точные границы ТОЛЬКО самой эмблемы [ymin, xmin, ymax, xmax] от 0 до 1000. Если не уверен или эмблемы нет — верни null.
 
 Структура JSON:
 {{
@@ -190,7 +187,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   "email": "email",
   "website": "сайт",
   "address": "адрес",
-  "logo_description": "Краткое описание выбранной эмблемы",
+  "logo_description": "Краткое описание эмблемы",
   "logo_bbox": [ymin, xmin, ymax, xmax],
   "summary_note": "Если передан комментарий пользователя, сожми его до 1 короткого предложения. Если комментария нет, оставь пустым"
 }}
@@ -227,7 +224,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_note = data.get("summary_note", "")
     logo_bbox = data.get("logo_bbox")
 
-    # Вырезаем выверенную эмблему с автоповоротом по EXIF
     logo_base64 = crop_logo_base64(jpeg_bytes, logo_bbox)
 
     msg_text = (

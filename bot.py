@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from telegram import Update
 from telegram.ext import (
@@ -33,20 +33,27 @@ client = OpenAI(
 )
 
 
+def load_and_fix_orientation(image_bytes: bytes) -> Image.Image:
+  """Открывает изображение и правильно поворачивает его согласно EXIF метаданным iPhone."""
+  img = Image.open(io.BytesIO(image_bytes))
+  img = ImageOps.exif_transpose(img)
+  if img.mode != "RGB":
+    img = img.convert("RGB")
+  return img
+
+
 def convert_image_to_jpeg_bytes(image_bytes: bytes) -> bytes:
-  """Конвертирует входное фото в стандартные байты JPEG."""
-  image = Image.open(io.BytesIO(image_bytes))
-  if image.mode != "RGB":
-    image = image.convert("RGB")
+  """Конвертирует входное фото в стандартные байты JPEG с учетом поворота."""
+  img = load_and_fix_orientation(image_bytes)
   output_buffer = io.BytesIO()
-  image.save(output_buffer, format="JPEG", quality=95)
+  img.save(output_buffer, format="JPEG", quality=95)
   return output_buffer.getvalue()
 
 
 def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
   """Вырезает логотип по координатам bbox [ymin, xmin, ymax, xmax] (0..1000)
 
-  и возвращает Base64 строку.
+  с учетом EXIF-ориентации и небольшим запасом.
   """
   if not bbox or len(bbox) != 4:
     return ""
@@ -54,6 +61,15 @@ def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
     img = Image.open(io.BytesIO(jpeg_bytes))
     w, h = img.size
     ymin, xmin, ymax, xmax = bbox
+
+    # Добавляем 5% запаса (padding) вокруг логотипа, чтобы не резать впритык
+    pad_h = int((ymax - ymin) * 0.05)
+    pad_w = int((xmax - xmin) * 0.05)
+
+    ymin = max(0, ymin - pad_h)
+    xmin = max(0, xmin - pad_w)
+    ymax = min(1000, ymax + pad_h)
+    xmax = min(1000, xmax + pad_w)
 
     # Перевод координат 0..1000 в реальные пиксели
     left = max(0, int(xmin * w / 1000))
@@ -65,7 +81,7 @@ def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
       return ""
 
     cropped = img.crop((left, top, right, bottom))
-    # Оптимизируем размер аватарки для контакта
+    # Оптимизируем размер аватарки
     cropped.thumbnail((400, 400))
 
     buf = io.BytesIO()
@@ -117,7 +133,6 @@ def generate_vcard(
   if user_note:
     vcard_lines.append(f"NOTE:{user_note}")
 
-  # Вшиваем аватарку логотипа
   if logo_base64:
     vcard_lines.append(f"PHOTO;TYPE=JPEG;ENCODING=b:{logo_base64}")
 
@@ -127,15 +142,14 @@ def generate_vcard(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
-      "Привет, Владимир! Отправь мне фотографию визитки. Вы можете добавить"
-      " комментарий голосом или текстом — я формирую файл контакта .vcf с"
-      " заметок и логотипом для iPhone!"
+      "Привет, Владимир! Отправь мне фотографию визитки. Я создам контакт .vcf"
+      " с верным логотипом и заметками!"
   )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   status_msg = await update.message.reply_text(
-      "Распознаю визитку, подбираю правильный логотип и создаю файл"
+      "Распознаю визитку, определяю профильный логотип и создаю файл"
       " контакта..."
   )
 
@@ -153,15 +167,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_file = await context.bot.get_file(file_id)
     raw_bytes = await telegram_file.download_as_bytearray()
 
+    # Поворачиваем изображение по EXIF и переводим в JPEG
     jpeg_bytes = convert_image_to_jpeg_bytes(bytes(raw_bytes))
     base64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
 
     prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
-ПРАВИЛА ДЛЯ ВЫБОРА ЛОГОТИПА (logo_bbox):
-1. СТРОГО ИГНОРИРУЙ QR-КОДЫ И ШТРИХ-КОДЫ! Ни в коем случае не выделяй QR-код как логотип.
-2. Если на визитке присутствует несколько графических символов (например, герб города/субъекта и эмблема конкретного органа власти или компании), выбери рамку того логотипа, который наиболее точно отражает профильную организацию/службу/ведомство этого человека.
-3. Укажи рамку выбранного логотипа [ymin, xmin, ymax, xmax] по шкале от 0 до 1000. Если логотипа нет, верни null.
+ПРАВИЛА ОПРЕДЕЛЕНИЯ ЛОГОТИПА (logo_bbox):
+1. ИГНОРИРУЙ QR-КОДЫ И ШТРИХ-КОДЫ.
+2. Если на визитке есть общая символика (например, Герб города/субъекта слева) и профильная эмблема службы/ведомства/компании (например, Эмблема Гостехнадзора справа), выбери ПРОФИЛЬНУЮ ЭМБЛЕМУ ВЕДОМСТВА/КОМПАНИИ.
+3. Верни рамку выбранной эмблемы [ymin, xmin, ymax, xmax] по шкале 0..1000 строго вокруг самой эмблемы.
 
 Структура JSON:
 {{
@@ -169,13 +184,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   "first_name": "Имя",
   "last_name": "Фамилия",
   "middle_name": "Отчество (если есть)",
-  "company": "Название компании или органа власти",
+  "company": "Название компании или ведомства",
   "position": "Должность",
   "phones": ["телефон 1", "телефон 2"],
   "email": "email",
   "website": "сайт",
   "address": "адрес",
-  "logo_description": "Краткое описание выбранного логотипа/символа",
+  "logo_description": "Краткое описание выбранной эмблемы",
   "logo_bbox": [ymin, xmin, ymax, xmax],
   "summary_note": "Если передан комментарий пользователя, сожми его до 1 короткого предложения. Если комментария нет, оставь пустым"
 }}
@@ -212,7 +227,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_note = data.get("summary_note", "")
     logo_bbox = data.get("logo_bbox")
 
-    # Вырезаем именно профильный логотип (без QR-кодов)
+    # Вырезаем выверенную эмблему с автоповоротом по EXIF
     logo_base64 = crop_logo_base64(jpeg_bytes, logo_bbox)
 
     msg_text = (

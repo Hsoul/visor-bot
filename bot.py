@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from openai import OpenAI
-from PIL import Image, ImageOps
+from PIL import Image
 from pillow_heif import register_heif_opener
 from telegram import Update
 from telegram.ext import (
@@ -33,78 +33,18 @@ client = OpenAI(
 )
 
 
-def load_and_fix_orientation(image_bytes: bytes) -> Image.Image:
-  """Открывает изображение и правильно поворачивает его согласно EXIF метаданным iPhone."""
-  img = Image.open(io.BytesIO(image_bytes))
-  img = ImageOps.exif_transpose(img)
-  if img.mode != "RGB":
-    img = img.convert("RGB")
-  return img
-
-
-def convert_image_to_jpeg_bytes(image_bytes: bytes) -> bytes:
-  """Конвертирует входное фото в стандартные байты JPEG с учетом автоповорота."""
-  img = load_and_fix_orientation(image_bytes)
+def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
+  """Конвертирует входной файл (включая HEIC) в JPEG и переводит в Base64."""
+  image = Image.open(io.BytesIO(image_bytes))
+  if image.mode != "RGB":
+    image = image.convert("RGB")
   output_buffer = io.BytesIO()
-  img.save(output_buffer, format="JPEG", quality=95)
-  return output_buffer.getvalue()
+  image.save(output_buffer, format="JPEG", quality=95)
+  return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
 
 
-def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
-  """Вырезает логотип по координатам bbox [ymin, xmin, ymax, xmax] (0..1000)
-
-  с фильтрацией ложных срабатываний на краях.
-  """
-  if not bbox or len(bbox) != 4:
-    return ""
-  try:
-    img = Image.open(io.BytesIO(jpeg_bytes))
-    w, h = img.size
-    ymin, xmin, ymax, xmax = bbox
-
-    logging.info(
-        f"Получены координаты логотипа: ymin={ymin}, xmin={xmin}, ymax={ymax},"
-        f" xmax={xmax}"
-    )
-
-    # Защита от сбоев: если рамка уходит в самый верх кадра (край визитки/стол)
-    if ymin < 30 and (ymax - ymin) < 120:
-      logging.warning(
-          "Отвергнуты координаты: детекция попала на верхний край кадра/стол."
-      )
-      return ""
-
-    if ymax <= ymin or xmax <= xmin:
-      return ""
-
-    # Перевод координат 0..1000 в реальные пиксели
-    left = max(0, int(xmin * w / 1000))
-    top = max(0, int(ymin * h / 1000))
-    right = min(w, int(xmax * w / 1000))
-    bottom = min(h, int(ymax * h / 1000))
-
-    crop_w = right - left
-    crop_h = bottom - top
-
-    # Фильтр слишком мелких фрагментов
-    if crop_w < 30 or crop_h < 30:
-      return ""
-
-    cropped = img.crop((left, top, right, bottom))
-    cropped.thumbnail((400, 400))
-
-    buf = io.BytesIO()
-    cropped.save(buf, format="JPEG", quality=90)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-  except Exception as e:
-    logging.error(f"Ошибка при вырезании логотипа: {e}")
-    return ""
-
-
-def generate_vcard(
-    data: dict, user_note: str = "", logo_base64: str = ""
-) -> str:
-  """Формирует vCard (версия 3.0) с аватаркой логотипа для iOS."""
+def generate_vcard(data: dict, user_note: str = "") -> str:
+  """Формирует чистый vCard (версия 3.0) без фото/аватарок."""
   fn = data.get("full_name", "Неизвестный контакт")
   last_name = data.get("last_name", "")
   first_name = data.get("first_name", "")
@@ -139,11 +79,9 @@ def generate_vcard(
   if address:
     vcard_lines.append(f"ADR:;;{address};;;;")
 
+  # В заметку попадает ТОЛЬКО пользовательский комментарий
   if user_note:
     vcard_lines.append(f"NOTE:{user_note}")
-
-  if logo_base64:
-    vcard_lines.append(f"PHOTO;TYPE=JPEG;ENCODING=b:{logo_base64}")
 
   vcard_lines.append("END:VCARD")
   return "\n".join(vcard_lines)
@@ -151,8 +89,9 @@ def generate_vcard(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
-      "Привет, Владимир! Отправь мне фотографию визитки. Я сформирую файл"
-      " контакта .vcf для iPhone!"
+      "Привет, Владимир! Отправь мне фотографию визитки. Вы можете добавить"
+      " подпись к фото с комментарием — я сожму его в заметку и сформирую"
+      " файл контакта .vcf для iPhone!"
   )
 
 
@@ -173,18 +112,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_caption = update.message.caption or ""
 
     telegram_file = await context.bot.get_file(file_id)
-    raw_bytes = await telegram_file.download_as_bytearray()
-
-    jpeg_bytes = convert_image_to_jpeg_bytes(bytes(raw_bytes))
-    base64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
+    image_bytes = await telegram_file.download_as_bytearray()
+    base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
 
     prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
-
-ПРАВИЛА ДЕТЕКЦИИ ЛОГОТИПA (logo_bbox):
-1. Логотип — это графический значок/эмблема компании (например, черно-красный знак "Калашников", эмблема ведомства, иконка).
-2. СТРОГО ИГНОРИРУЙ край бумажной визитки, стол, QR-коды и текстовые блоки.
-3. Укажи точную рамку [ymin, xmin, ymax, xmax] от 0 до 1000 СТРОГО вокруг самой графической эмблемы.
-4. Если графика не обнаружена — верни null.
 
 Структура JSON:
 {{
@@ -198,8 +129,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   "email": "email",
   "website": "сайт",
   "address": "адрес",
-  "logo_description": "Краткое описание эмблемы",
-  "logo_bbox": [ymin, xmin, ymax, xmax],
+  "logo_description": "Краткое описание логотипа/символа (если есть)",
   "summary_note": "Если передан комментарий пользователя, сожми его до 1 короткого предложения. Если комментария нет, оставь пустым"
 }}
 
@@ -233,9 +163,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [f"  - {p}" for p in data.get("phones", [])]
     ) or "Не указан"
     summary_note = data.get("summary_note", "")
-    logo_bbox = data.get("logo_bbox")
-
-    logo_base64 = crop_logo_base64(jpeg_bytes, logo_bbox)
 
     msg_text = (
         f"👤 **ФИО:** {data.get('full_name', '-')}\n"
@@ -252,9 +179,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text(msg_text, parse_mode="Markdown")
 
-    vcard_str = generate_vcard(
-        data, user_note=summary_note, logo_base64=logo_base64
-    )
+    vcard_str = generate_vcard(data, user_note=summary_note)
     vcard_bytes = vcard_str.encode("utf-8")
 
     filename = (
@@ -266,7 +191,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=vcard_file,
-        caption="🎴 Карточка контакта сформирована!",
+        caption="🎴 Карточка контакта сформирована! Нажмите и сохраните в «Контакты».",
     )
 
   except Exception as e:

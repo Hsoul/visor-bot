@@ -53,7 +53,7 @@ def convert_image_to_jpeg_bytes(image_bytes: bytes) -> bytes:
 def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
   """Вырезает логотип по координатам bbox [ymin, xmin, ymax, xmax] (0..1000)
 
-  с проверкой корректности границ.
+  с фильтрацией ложных срабатываний на краях.
   """
   if not bbox or len(bbox) != 4:
     return ""
@@ -62,7 +62,18 @@ def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
     w, h = img.size
     ymin, xmin, ymax, xmax = bbox
 
-    # Защита от сбоев: если рамка уходит в край кадра (стол) или некорректна
+    logging.info(
+        f"Получены координаты логотипа: ymin={ymin}, xmin={xmin}, ymax={ymax},"
+        f" xmax={xmax}"
+    )
+
+    # Защита от сбоев: если рамка уходит в самый верх кадра (край визитки/стол)
+    if ymin < 30 and (ymax - ymin) < 120:
+      logging.warning(
+          "Отвергнуты координаты: детекция попала на верхний край кадра/стол."
+      )
+      return ""
+
     if ymax <= ymin or xmax <= xmin:
       return ""
 
@@ -75,8 +86,8 @@ def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
     crop_w = right - left
     crop_h = bottom - top
 
-    # Если вырезанный фрагмент слишком маленький или узкий — пропускаем
-    if crop_w < 20 or crop_h < 20:
+    # Фильтр слишком мелких фрагментов
+    if crop_w < 30 or crop_h < 30:
       return ""
 
     cropped = img.crop((left, top, right, bottom))
@@ -169,11 +180,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
-ПРАВИЛА ОПРЕДЕЛЕНИЯ ЛОГОТИПА (logo_bbox):
-1. ИГНОРИРУЙ СТОЛ, ФОН И КРАЯ САМОЙ БУМАЖНОЙ ВИЗИТКИ. Ищи эмблему ТОЛЬКО внутри напечатанного поля визитки.
-2. ИГНОРИРУЙ QR-КОДЫ И ШТРИХ-КОДЫ.
-3. Если есть герб региона/города и профильная эмблема ведомства/компании — выбери профильную эмблему ведомства/компании.
-4. Укажи точные границы ТОЛЬКО самой эмблемы [ymin, xmin, ymax, xmax] от 0 до 1000. Если не уверен или эмблемы нет — верни null.
+ПРАВИЛА ДЕТЕКЦИИ ЛОГОТИПA (logo_bbox):
+1. Логотип — это графический значок/эмблема компании (например, черно-красный знак "Калашников", эмблема ведомства, иконка).
+2. СТРОГО ИГНОРИРУЙ край бумажной визитки, стол, QR-коды и текстовые блоки.
+3. Укажи точную рамку [ymin, xmin, ymax, xmax] от 0 до 1000 СТРОГО вокруг самой графической эмблемы.
+4. Если графика не обнаружена — верни null.
 
 Структура JSON:
 {{

@@ -1,3 +1,4 @@
-pyTelegramBotAPI
-pillow
-google-generativeai
+python-telegram-bot
+openai
+Pillow
+pillow-heif

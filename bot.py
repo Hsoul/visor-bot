@@ -33,17 +33,53 @@ client = OpenAI(
 )
 
 
-def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
+def convert_image_to_jpeg_bytes(image_bytes: bytes) -> bytes:
+  """Конвертирует входное фото в стандартные байты JPEG."""
   image = Image.open(io.BytesIO(image_bytes))
   if image.mode != "RGB":
     image = image.convert("RGB")
   output_buffer = io.BytesIO()
   image.save(output_buffer, format="JPEG", quality=95)
-  return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
+  return output_buffer.getvalue()
 
 
-def generate_vcard(data: dict, user_note: str = "") -> str:
-  """Формирует стандартный vCard (версия 3.0) для iOS / Android."""
+def crop_logo_base64(jpeg_bytes: bytes, bbox: list) -> str:
+  """Вырезает логотип по координатам bbox [ymin, xmin, ymax, xmax] (0..1000)
+
+  и возвращает Base64 строку.
+  """
+  if not bbox or len(bbox) != 4:
+    return ""
+  try:
+    img = Image.open(io.BytesIO(jpeg_bytes))
+    w, h = img.size
+    ymin, xmin, ymax, xmax = bbox
+
+    # Перевод координат 0..1000 в реальные пиксели
+    left = max(0, int(xmin * w / 1000))
+    top = max(0, int(ymin * h / 1000))
+    right = min(w, int(xmax * w / 1000))
+    bottom = min(h, int(ymax * h / 1000))
+
+    if right <= left or bottom <= top:
+      return ""
+
+    cropped = img.crop((left, top, right, bottom))
+    # Оптимизируем размер аватарки для контакта
+    cropped.thumbnail((400, 400))
+
+    buf = io.BytesIO()
+    cropped.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+  except Exception as e:
+    logging.error(f"Ошибка при вырезании логотипа: {e}")
+    return ""
+
+
+def generate_vcard(
+    data: dict, user_note: str = "", logo_base64: str = ""
+) -> str:
+  """Формирует vCard (версия 3.0) с аватаркой логотипа для iOS."""
   fn = data.get("full_name", "Неизвестный контакт")
   last_name = data.get("last_name", "")
   first_name = data.get("first_name", "")
@@ -78,9 +114,12 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
   if address:
     vcard_lines.append(f"ADR:;;{address};;;;")
 
-  # В заметку попадает ТОЛЬКО пользовательский комментарий
   if user_note:
     vcard_lines.append(f"NOTE:{user_note}")
+
+  # Вшиваем аватарку логотипа
+  if logo_base64:
+    vcard_lines.append(f"PHOTO;TYPE=JPEG;ENCODING=b:{logo_base64}")
 
   vcard_lines.append("END:VCARD")
   return "\n".join(vcard_lines)
@@ -89,14 +128,15 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
       "Привет, Владимир! Отправь мне фотографию визитки. Вы можете добавить"
-      " подпись к фото с комментарием — я сожму его в заметку и сформирую"
-      " файл контакта .vcf для iPhone!"
+      " комментарий голосом или текстом — я формирую файл контакта .vcf с"
+      " заметок и логотипом для iPhone!"
   )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   status_msg = await update.message.reply_text(
-      "Распознаю визитку и создаю файл контакта..."
+      "Распознаю визитку, подбираю правильный логотип и создаю файл"
+      " контакта..."
   )
 
   try:
@@ -108,27 +148,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
       await status_msg.edit_text("Пожалуйста, отправьте изображение.")
       return
 
-    # Получаем подпись к фото (если пользователь что-то написал)
     user_caption = update.message.caption or ""
 
     telegram_file = await context.bot.get_file(file_id)
-    image_bytes = await telegram_file.download_as_bytearray()
-    base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
+    raw_bytes = await telegram_file.download_as_bytearray()
+
+    jpeg_bytes = convert_image_to_jpeg_bytes(bytes(raw_bytes))
+    base64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
 
     prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
+
+ПРАВИЛА ДЛЯ ВЫБОРА ЛОГОТИПА (logo_bbox):
+1. СТРОГО ИГНОРИРУЙ QR-КОДЫ И ШТРИХ-КОДЫ! Ни в коем случае не выделяй QR-код как логотип.
+2. Если на визитке присутствует несколько графических символов (например, герб города/субъекта и эмблема конкретного органа власти или компании), выбери рамку того логотипа, который наиболее точно отражает профильную организацию/службу/ведомство этого человека.
+3. Укажи рамку выбранного логотипа [ymin, xmin, ymax, xmax] по шкале от 0 до 1000. Если логотипа нет, верни null.
+
 Структура JSON:
 {{
   "full_name": "ФИО целиком",
   "first_name": "Имя",
   "last_name": "Фамилия",
   "middle_name": "Отчество (если есть)",
-  "company": "Название компании",
+  "company": "Название компании или органа власти",
   "position": "Должность",
   "phones": ["телефон 1", "телефон 2"],
   "email": "email",
   "website": "сайт",
   "address": "адрес",
-  "logo_description": "Краткое описание логотипа/символа",
+  "logo_description": "Краткое описание выбранного логотипа/символа",
+  "logo_bbox": [ymin, xmin, ymax, xmax],
   "summary_note": "Если передан комментарий пользователя, сожми его до 1 короткого предложения. Если комментария нет, оставь пустым"
 }}
 
@@ -162,6 +210,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [f"  - {p}" for p in data.get("phones", [])]
     ) or "Не указан"
     summary_note = data.get("summary_note", "")
+    logo_bbox = data.get("logo_bbox")
+
+    # Вырезаем именно профильный логотип (без QR-кодов)
+    logo_base64 = crop_logo_base64(jpeg_bytes, logo_bbox)
 
     msg_text = (
         f"👤 **ФИО:** {data.get('full_name', '-')}\n"
@@ -178,8 +230,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text(msg_text, parse_mode="Markdown")
 
-    # Генерируем чистый .vcf файл (без упоминания логотипа)
-    vcard_str = generate_vcard(data, user_note=summary_note)
+    vcard_str = generate_vcard(
+        data, user_note=summary_note, logo_base64=logo_base64
+    )
     vcard_bytes = vcard_str.encode("utf-8")
 
     filename = (
@@ -191,7 +244,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=vcard_file,
-        caption="🎴 Нажмите на файл и выберите «Контакты», чтобы сохранить!",
+        caption="🎴 Карточка контакта сформирована!",
     )
 
   except Exception as e:

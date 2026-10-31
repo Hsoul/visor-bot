@@ -86,9 +86,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- 📍 **Адрес:**"
     )
 
-    # Запрос к Qwen2.5-VL через OpenRouter
+    # Запрос к Qwen2.5-VL через OpenRouter (флагманская модель 72B)
     response = client.chat.completions.create(
-        model="qwen/qwen-2.5-vl-7b-instruct",
+        model="qwen/qwen2.5-vl-72b-instruct",
         messages=[{
             "role": "user",
             "content": [

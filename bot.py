@@ -1,79 +1,127 @@
-import os
+import base64
 import io
-import sys
-import time
-import subprocess
+import logging
+import os
+from openai import OpenAI
+from PIL import Image
+from pillow_heif import register_heif_opener
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# --- Авто-установка зависимостей ---
-def install_dependencies():
-    print("Установка необходимых библиотек...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyTelegramBotAPI", "pillow", "google-generativeai"])
+# Регистрируем поддержку HEIC файлов с iPhone
+register_heif_opener()
 
-try:
-    import telebot
-    import google.generativeai as genai
-    from PIL import Image
-except ImportError:
-    install_dependencies()
-    import telebot
-    import google.generativeai as genai
-    from PIL import Image
-# -----------------------------------
+# Логирование
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
+# Переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("Критическая ошибка: Не найдены ключи в переменных окружения.")
+# Инициализация клиента OpenRouter (совместим с OpenAI)
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
-genai.configure(api_key=GEMINI_API_KEY)
 
-# Жестко задаем требуемую сервером модель
-model = genai.GenerativeModel('gemini-3.8-flash')
+def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
+  """Конвертирует любое фото (включая HEIC) в JPEG и переводит в Base64."""
+  image = Image.open(io.BytesIO(image_bytes))
+  if image.mode != "RGB":
+    image = image.convert("RGB")
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+  output_buffer = io.BytesIO()
+  image.save(output_buffer, format="JPEG", quality=95)
+  jpeg_bytes = output_buffer.getvalue()
 
-SYSTEM_PROMPT = """
-Проанализируй фото визитной карточки. Извлеки все контактные данные и расположи их в структурированном виде:
-- 👤 **ФИО:** 
-- 🏢 **Компания и должность:** 
-- 📞 **Телефон:** 
-- ✉️ **Email:** 
-- 🌐 **Сайт:** 
-- 📍 **Адрес:** 
+  return base64.b64encode(jpeg_bytes).decode("utf-8")
 
-Если какой-то параметр отсутствует на визитке, просто пропусти его. Ответ давай кратко, без вводных фраз.
-"""
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message, "Привет! Отправь мне фотографию визитки, и я распознаю все контактные данные.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  await update.message.reply_text(
+      "Привет, Владимир! Отправь мне фотографию визитки (как фото или файл), "
+      "и я зафиксирую все контактные данные и логотип."
+  )
 
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    try:
-        bot.send_chat_action(message.chat.id, 'typing')
-        
-        file_info = bot.get_file(message.photo[-1].file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        
-        image = Image.open(io.BytesIO(downloaded_file))
-        
-        response = model.generate_content([SYSTEM_PROMPT, image])
-        
-        if response.text:
-            bot.reply_to(message, response.text)
-        else:
-            bot.reply_to(message, "Не удалось прочитать данные с визитки.")
-            
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка обработки: {e}")
 
-if __name__ == '__main__':
-    print("Бот запускается...")
-    while True:
-        try:
-            bot.polling(none_stop=True)
-        except Exception as e:
-            print(f"Сбой соединения: {e}. Перезапуск через 5 секунд...")
-            time.sleep(5)
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  status_msg = await update.message.reply_text("Обрабатываю визитку через Qwen...")
+
+  try:
+    # Получаем файл из фото или документа
+    if update.message.photo:
+      file_id = update.message.photo[-1].file_id
+    elif update.message.document:
+      file_id = update.message.document.file_id
+    else:
+      await status_msg.edit_text("Пожалуйста, отправьте изображение.")
+      return
+
+    telegram_file = await context.bot.get_file(file_id)
+    image_bytes = await telegram_file.download_as_bytearray()
+
+    # Конвертация в JPEG Base64
+    base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
+
+    prompt = (
+        "Считай все данные с этой визитки и выведи их в четком структурированном"
+        " виде:\n"
+        "- 👤 **ФИО:**\n"
+        "- 🏢 **Компания и должность:**\n"
+        "- 🎨 **Логотип / Эмблема:** (Опиши графический символ, знак или текст на"
+        " логотипе)\n"
+        "- 📞 **Телефон:**\n"
+        "- ✉️ **Email:**\n"
+        "- 🌐 **Сайт:**\n"
+        "- 📍 **Адрес:**"
+    )
+
+    # Запрос к Qwen2.5-VL через OpenRouter
+    response = client.chat.completions.create(
+        model="qwen/qwen-2.5-vl-7b-instruct",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    },
+                },
+            ],
+        }],
+    )
+
+    result_text = response.choices[0].message.content
+    await status_msg.edit_text(result_text, parse_mode="Markdown")
+
+  except Exception as e:
+    logging.error(f"Ошибка: {e}")
+    await status_msg.edit_text(f"Произошла ошибка при обработке: {e}")
+
+
+def main():
+  app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+  app.add_handler(CommandHandler("start", start))
+  app.add_handler(
+      MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+  )
+
+  logging.info("Бот запущен...")
+  app.run_polling()
+
+
+if __name__ == "__main__":
+  main()

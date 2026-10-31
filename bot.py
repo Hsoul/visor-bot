@@ -86,7 +86,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- 📍 **Адрес:**"
     )
 
-    # Запрос к Qwen2.5-VL через OpenRouter (флагманская модель 72B)
+    # Запрос к Qwen2.5-VL через OpenRouter с ограничением длины ответа
     response = client.chat.completions.create(
         model="qwen/qwen2.5-vl-72b-instruct",
         messages=[{
@@ -101,6 +101,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 },
             ],
         }],
+        max_tokens=1000,  # Зажимаем размер ответа, чтобы не вылезать за лимиты OpenRouter
     )
 
     result_text = response.choices[0].message.content

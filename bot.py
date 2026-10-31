@@ -55,15 +55,6 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
   email = data.get("email", "")
   site = data.get("website", "")
   address = data.get("address", "")
-  logo = data.get("logo_description", "")
-
-  # Формируем текст заметки
-  note_parts = []
-  if user_note:
-    note_parts.append(f"Заметка: {user_note}")
-  if logo:
-    note_parts.append(f"Логотип: {logo}")
-  full_note = " | ".join(note_parts)
 
   vcard_lines = [
       "BEGIN:VCARD",
@@ -86,8 +77,10 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
     vcard_lines.append(f"URL:{site}")
   if address:
     vcard_lines.append(f"ADR:;;{address};;;;")
-  if full_note:
-    vcard_lines.append(f"NOTE:{full_note}")
+
+  # В заметку попадает ТОЛЬКО пользовательский комментарий
+  if user_note:
+    vcard_lines.append(f"NOTE:{user_note}")
 
   vcard_lines.append("END:VCARD")
   return "\n".join(vcard_lines)
@@ -160,13 +153,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     raw_json = response.choices[0].message.content.strip()
-    # Очистка от возможных тэгов markdown
     raw_json = re.sub(r"^```json\s*", "", raw_json)
     raw_json = re.sub(r"\s*```$", "", raw_json)
 
     data = json.loads(raw_json)
 
-    # Формируем красиво оформленный текст
     phones_str = "\n".join(
         [f"  - {p}" for p in data.get("phones", [])]
     ) or "Не указан"
@@ -187,7 +178,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text(msg_text, parse_mode="Markdown")
 
-    # Генерируем .vcf файл
+    # Генерируем чистый .vcf файл (без упоминания логотипа)
     vcard_str = generate_vcard(data, user_note=summary_note)
     vcard_bytes = vcard_str.encode("utf-8")
 
@@ -197,11 +188,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vcard_file = io.BytesIO(vcard_bytes)
     vcard_file.name = filename
 
-    # Отправляем карточку vCard документом в Telegram
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=vcard_file,
-        caption="🎴 Нажмите на файл, чтобы импортировать контакт в iPhone!",
+        caption="🎴 Нажмите на файл и выберите «Контакты», чтобы сохранить!",
     )
 
   except Exception as e:

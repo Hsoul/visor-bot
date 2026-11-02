@@ -35,6 +35,31 @@ client = OpenAI(
 )
 
 
+def normalize_phone(phone: str) -> str:
+  """Приводит любой российский номер телефона к идеальному формату +7 (XXX) XXX-XX-XX."""
+  if not phone:
+    return ""
+
+  # Оставляем только цифры
+  digits = re.sub(r"\D", "", phone)
+
+  # Если 10 цифр (например, 8129502838 или 9819764034) -> добавляем 7
+  if len(digits) == 10:
+    digits = "7" + digits
+  # Если 11 цифр и начинается с 8 -> меняем 8 на 7
+  elif len(digits) == 11 and digits.startswith("8"):
+    digits = "7" + digits[1:]
+
+  # Форматируем 11-значный российский номер в красиво читаемый вид для iOS
+  if len(digits) == 11 and digits.startswith("7"):
+    return (
+        f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+    )
+
+  # Если номер международный другой страны или не поддаётся маске — возвращаем с +
+  return f"+{digits}" if digits else phone
+
+
 def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
   """Конвертирует входной файл (включая HEIC) в JPEG и переводит в Base64."""
   image = Image.open(io.BytesIO(image_bytes))
@@ -72,7 +97,9 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
     vcard_lines.append(f"TITLE:{title}")
 
   for phone in phones:
-    vcard_lines.append(f"TEL;TYPE=CELL:{phone}")
+    norm_p = normalize_phone(phone)
+    if norm_p:
+      vcard_lines.append(f"TEL;TYPE=CELL:{norm_p}")
 
   if email:
     vcard_lines.append(f"EMAIL:{email}")
@@ -89,7 +116,7 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
 
 
 def safe_html(text: str) -> str:
-  """Экранирует спецсимволы HTML, чтобы подчёркивания и знаки в email не ломали разметку."""
+  """Экранирует спецсимволы HTML."""
   return html.escape(str(text or "-"))
 
 
@@ -123,6 +150,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
+ПРАВИЛА ДЛЯ ТЕЛЕФОНОВ:
+1. Обязательно приводи ВСЕ российские телефонные номера к международному формату с кодом страны +7 (например, +7 (812) 950-28-38 или +7 (981) 976-40-34), даже если на визитке не указан код +7 или 8!
+
 Структура JSON:
 {{
   "full_name": "ФИО целиком",
@@ -142,7 +172,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Комментарий пользователя: "{user_caption}"
 """
 
-    # Устойчивый вызов API с автоповтором при ошибках 429 или таймаутах (3 попытки)
     response = None
     max_retries = 3
 
@@ -171,7 +200,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" {api_err}"
         )
         if attempt < max_retries - 1:
-          await asyncio.sleep(3 * (attempt + 1))  # Пауза 3 сек, затем 6 сек
+          await asyncio.sleep(3 * (attempt + 1))
         else:
           raise api_err
 
@@ -181,15 +210,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = json.loads(raw_json)
 
-    phones_list = data.get("phones", [])
+    # Прогоняем полученные телефоны через обработчик нормализации
+    raw_phones = data.get("phones", [])
+    normalized_phones = [
+        normalize_phone(p) for p in raw_phones if normalize_phone(p)
+    ]
+    data["phones"] = normalized_phones
+
     phones_str = (
-        "\n".join([f"  - {safe_html(p)}" for p in phones_list])
-        if phones_list
+        "\n".join([f"  - {safe_html(p)}" for p in normalized_phones])
+        if normalized_phones
         else "Не указан"
     )
     summary_note = data.get("summary_note", "")
 
-    # Формируем безопасное HTML-сообщение
     msg_text = (
         f"👤 <b>ФИО:</b> {safe_html(data.get('full_name'))}\n"
         f"🏢 <b>Компания:</b> {safe_html(data.get('company'))}\n"

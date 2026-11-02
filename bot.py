@@ -1,4 +1,5 @@
 import base64
+import html
 import io
 import json
 import logging
@@ -79,12 +80,16 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
   if address:
     vcard_lines.append(f"ADR:;;{address};;;;")
 
-  # В заметку попадает ТОЛЬКО пользовательский комментарий
   if user_note:
     vcard_lines.append(f"NOTE:{user_note}")
 
   vcard_lines.append("END:VCARD")
   return "\n".join(vcard_lines)
+
+
+def safe_html(text: str) -> str:
+  """Экранирует спецсимволы HTML, чтобы подчёркивания и знаки в email не ломали разметку."""
+  return html.escape(str(text or "-"))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,25 +164,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = json.loads(raw_json)
 
-    phones_str = "\n".join(
-        [f"  - {p}" for p in data.get("phones", [])]
-    ) or "Не указан"
+    phones_list = data.get("phones", [])
+    phones_str = (
+        "\n".join([f"  - {safe_html(p)}" for p in phones_list])
+        if phones_list
+        else "Не указан"
+    )
     summary_note = data.get("summary_note", "")
 
+    # Формируем безопасное HTML-сообщение
     msg_text = (
-        f"👤 **ФИО:** {data.get('full_name', '-')}\n"
-        f"🏢 **Компания:** {data.get('company', '-')}\n"
-        f"💼 **Должность:** {data.get('position', '-')}\n"
-        f"🎨 **Логотип:** {data.get('logo_description', '-')}\n"
-        f"📞 **Телефоны:**\n{phones_str}\n"
-        f"✉️ **Email:** {data.get('email', '-')}\n"
-        f"🌐 **Сайт:** {data.get('website', '-')}\n"
-        f"📍 **Адрес:** {data.get('address', '-')}\n"
+        f"👤 <b>ФИО:</b> {safe_html(data.get('full_name'))}\n"
+        f"🏢 <b>Компания:</b> {safe_html(data.get('company'))}\n"
+        f"💼 <b>Должность:</b> {safe_html(data.get('position'))}\n"
+        f"🎨 <b>Логотип:</b> {safe_html(data.get('logo_description'))}\n"
+        f"📞 <b>Телефоны:</b>\n{phones_str}\n"
+        f"✉️ <b>Email:</b> {safe_html(data.get('email'))}\n"
+        f"🌐 <b>Сайт:</b> {safe_html(data.get('website'))}\n"
+        f"📍 <b>Адрес:</b> {safe_html(data.get('address'))}\n"
     )
     if summary_note:
-      msg_text += f"📝 **Заметка:** {summary_note}\n"
+      msg_text += f"📝 <b>Заметка:</b> {safe_html(summary_note)}\n"
 
-    await status_msg.edit_text(msg_text, parse_mode="Markdown")
+    await status_msg.edit_text(msg_text, parse_mode="HTML")
 
     vcard_str = generate_vcard(data, user_note=summary_note)
     vcard_bytes = vcard_str.encode("utf-8")
@@ -191,7 +200,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=vcard_file,
-        caption="🎴 Карточка контакта сформирована! Нажмите и сохраните в «Контакты».",
+        caption=(
+            "🎴 Карточка контакта сформирована! Нажмите и сохраните в"
+            " «Контакты»."
+        ),
     )
 
   except Exception as e:

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import html
 import io
@@ -141,22 +142,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Комментарий пользователя: "{user_caption}"
 """
 
-    response = client.chat.completions.create(
-        model="qwen/qwen2.5-vl-72b-instruct",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
+    # Устойчивый вызов API с автоповтором при ошибках 429 или таймаутах (3 попытки)
+    response = None
+    max_retries = 3
+
+    for attempt in range(max_retries):
+      try:
+        response = client.chat.completions.create(
+            model="qwen/qwen2.5-vl-72b-instruct",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        },
                     },
-                },
-            ],
-        }],
-        max_tokens=1500,
-    )
+                ],
+            }],
+            max_tokens=1500,
+        )
+        break
+      except Exception as api_err:
+        logging.warning(
+            f"Попытка {attempt + 1}/{max_retries} завершилась с ошибкой:"
+            f" {api_err}"
+        )
+        if attempt < max_retries - 1:
+          await asyncio.sleep(3 * (attempt + 1))  # Пауза 3 сек, затем 6 сек
+        else:
+          raise api_err
 
     raw_json = response.choices[0].message.content.strip()
     raw_json = re.sub(r"^```json\s*", "", raw_json)

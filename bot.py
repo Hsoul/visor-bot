@@ -6,9 +6,6 @@ import json
 import logging
 import os
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
 from openai import OpenAI
 from PIL import Image
 from pillow_heif import register_heif_opener
@@ -49,22 +46,21 @@ def normalize_phone(phone: str) -> str:
   # Оставляем только цифры
   digits = re.sub(r"\D", "", phone)
 
-  # Защита от дублирования префиксов (например, 7981931... -> 7931...)
-  if len(digits) > 11 and digits.startswith("7981931"):
-    digits = "7931" + digits[7:]
-  elif len(digits) > 11 and digits.startswith("8981931"):
+  # Защита от сдвоенных префиксов
+  if len(digits) > 11 and (
+      digits.startswith("7981931") or digits.startswith("8981931")
+  ):
     digits = "7931" + digits[7:]
 
-  # Если в номере 10 цифр (например, 9313260119 или 8125739038) -> добавляем 7
+  # Если 10 цифр -> добавляем 7
   if len(digits) == 10:
     digits = "7" + digits
   # Если 11 цифр и начинается с 8 -> меняем 8 на 7
   elif len(digits) == 11 and digits.startswith("8"):
     digits = "7" + digits[1:]
-  # Если длиннее 11 цифр из-за ошибки ИИ -> отсекаем префикс, оставляем последние 10 цифр и добавляем 7
+  # Если длиннее 11 цифр -> оставляем последние 10 цифр и добавляем 7
   elif len(digits) > 11:
-    clean_10 = digits[-10:]
-    digits = "7" + clean_10
+    digits = "7" + digits[-10:]
 
   # Форматируем ровно 11-значный российский номер в маску для iOS
   if len(digits) == 11 and digits.startswith("7"):
@@ -75,93 +71,8 @@ def normalize_phone(phone: str) -> str:
   return f"+{digits}" if digits else phone
 
 
-def fetch_site_logo_base64(website: str) -> str:
-  """Фоновый поиск официального логотипа/аватарки компании на её сайте через OpenGraph / Favicon.
-
-  Работает без тяжелых библиотек, с жестким таймаутом (4 сек), не нагружает
-  ОЗУ.
-  """
-  if not website or website == "-" or "не указан" in website.lower():
-    return ""
-
-  try:
-    url = website.strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
-      url = "https://" + url
-
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
-        },
-    )
-
-    with urllib.request.urlopen(req, timeout=4) as response:
-      html_content = response.read().decode("utf-8", errors="ignore")
-
-    # Ищем официальную картинку компании (og:image)
-    og_match = re.search(
-        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-        html_content,
-        re.IGNORECASE,
-    )
-    if not og_match:
-      og_match = re.search(
-          r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-          html_content,
-          re.IGNORECASE,
-      )
-
-    img_url = None
-    if og_match:
-      img_url = og_match.group(1)
-    else:
-      # Запасной вариант — фавиконка/иконка приложения компании
-      icon_match = re.search(
-          r'<link[^>]+rel=["\'](?:shortcut'
-          r' icon|icon|apple-touch-icon)["\'][^>]+href=["\']([^"\']+)["\']',
-          html_content,
-          re.IGNORECASE,
-      )
-      if icon_match:
-        img_url = icon_match.group(1)
-
-    if not img_url:
-      return ""
-
-    img_url = urllib.parse.urljoin(url, img_url)
-    img_req = urllib.request.Request(
-        img_url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
-        },
-    )
-
-    with urllib.request.urlopen(img_req, timeout=4) as img_resp:
-      img_data = img_resp.read()
-
-    img = Image.open(io.BytesIO(img_data))
-    if img.mode != "RGB":
-      img = img.convert("RGB")
-    img.thumbnail((400, 400))
-
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-  except Exception as e:
-    logging.info(
-        f"Логотип на сайте {website} не найден или доступ ограничен: {e}"
-    )
-    return ""
-
-
 def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
-  """Конвертирует входной файл (включая HEIC) в JPEG и переводит в Base64."""
+  """Конвертирует входной файл в JPEG и переводит в Base64."""
   image = Image.open(io.BytesIO(image_bytes))
   if image.mode != "RGB":
     image = image.convert("RGB")
@@ -170,13 +81,8 @@ def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
   return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
 
 
-def generate_vcard(
-    data: dict, user_note: str = "", logo_base64: str = ""
-) -> str:
-  """Формирует vCard (версия 3.0).
-
-  Если логотип найден — подшивает фото, если нет — создает чистый vCard.
-  """
+def generate_vcard(data: dict, user_note: str = "") -> str:
+  """Формирует чистый vCard (версия 3.0) без аватарок."""
   fn = data.get("full_name", "Неизвестный контакт")
   last_name = data.get("last_name", "")
   first_name = data.get("first_name", "")
@@ -215,10 +121,6 @@ def generate_vcard(
 
   if user_note:
     vcard_lines.append(f"NOTE:{user_note}")
-
-  # Вшиваем фото логотипа компании, только если оно реально найдено на сайте
-  if logo_base64:
-    vcard_lines.append(f"PHOTO;TYPE=JPEG;ENCODING=b:{logo_base64}")
 
   vcard_lines.append("END:VCARD")
   return "\n".join(vcard_lines)
@@ -275,7 +177,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
   "email": "email",
   "website": "сайт",
   "address": "адрес",
-  "logo_description": "Краткое описание логотипа/символа (если есть)",
   "summary_note": "Если передан комментарий пользователя, сожми его до 1 короткого предложения. Если комментария нет, оставь пустым"
 }}
 
@@ -320,16 +221,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = json.loads(raw_json)
 
-    # 1. Строгая нормализация номеров телефонов
+    # Строгая нормализация номеров телефонов
     raw_phones = data.get("phones", [])
     normalized_phones = [
         normalize_phone(p) for p in raw_phones if normalize_phone(p)
     ]
     data["phones"] = normalized_phones
-
-    # 2. Каскадный поиск логотипа компании на официальном сайте
-    website = data.get("website", "")
-    logo_base64 = fetch_site_logo_base64(website)
 
     phones_str = (
         "\n".join([f"  - {safe_html(p)}" for p in normalized_phones])
@@ -342,7 +239,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 <b>ФИО:</b> {safe_html(data.get('full_name'))}\n"
         f"🏢 <b>Компания:</b> {safe_html(data.get('company'))}\n"
         f"💼 <b>Должность:</b> {safe_html(data.get('position'))}\n"
-        f"🎨 <b>Логотип:</b> {safe_html(data.get('logo_description'))}\n"
         f"📞 <b>Телефоны:</b>\n{phones_str}\n"
         f"✉️ <b>Email:</b> {safe_html(data.get('email'))}\n"
         f"🌐 <b>Сайт:</b> {safe_html(data.get('website'))}\n"
@@ -353,10 +249,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text(msg_text, parse_mode="HTML")
 
-    # 3. Формирование vCard с фото логотипа (если найдено) или чистой карточки
-    vcard_str = generate_vcard(
-        data, user_note=summary_note, logo_base64=logo_base64
-    )
+    vcard_str = generate_vcard(data, user_note=summary_note)
     vcard_bytes = vcard_str.encode("utf-8")
 
     filename = (

@@ -29,9 +29,14 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+# Инициализация клиента OpenAI с приоритетными заголовками OpenRouter
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
+    default_headers={
+        "HTTP-Referer": "https://amvera.ru",
+        "X-Title": "VisorJamBot",
+    },
 )
 
 
@@ -43,7 +48,6 @@ def normalize_phone(phone: str) -> str:
   if not phone:
     return ""
 
-  # Оставляем только цифры
   digits = re.sub(r"\D", "", phone)
 
   # Защита от сдвоенных префиксов
@@ -52,17 +56,13 @@ def normalize_phone(phone: str) -> str:
   ):
     digits = "7931" + digits[7:]
 
-  # Если 10 цифр -> добавляем 7
   if len(digits) == 10:
     digits = "7" + digits
-  # Если 11 цифр и начинается с 8 -> меняем 8 на 7
   elif len(digits) == 11 and digits.startswith("8"):
     digits = "7" + digits[1:]
-  # Если длиннее 11 цифр -> оставляем последние 10 цифр и добавляем 7
   elif len(digits) > 11:
     digits = "7" + digits[-10:]
 
-  # Форматируем ровно 11-значный российский номер в маску для iOS
   if len(digits) == 11 and digits.startswith("7"):
     return (
         f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
@@ -131,6 +131,24 @@ def safe_html(text: str) -> str:
   return html.escape(str(text or "-"))
 
 
+def call_openrouter_api(prompt: str, base64_image: str):
+  """Выполняет синхронный вызов API OpenRouter в изолированном фоновом потоке."""
+  return client.chat.completions.create(
+      model="qwen/qwen2.5-vl-72b-instruct",
+      messages=[{
+          "role": "user",
+          "content": [
+              {"type": "text", "text": prompt},
+              {
+                  "type": "image_url",
+                  "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+              },
+          ],
+      }],
+      max_tokens=1500,
+  )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
       "Привет, Владимир! Отправь мне фотографию визитки. Вы можете добавить"
@@ -184,25 +202,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
 
     response = None
-    max_retries = 3
+    max_retries = 5
+    backoff_delays = [3, 6, 12, 20, 30]
 
     for attempt in range(max_retries):
       try:
-        response = client.chat.completions.create(
-            model="qwen/qwen2.5-vl-72b-instruct",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        },
-                    },
-                ],
-            }],
-            max_tokens=1500,
+        # Неблокирующий асинхронный вызов через asyncio.to_thread
+        response = await asyncio.to_thread(
+            call_openrouter_api, prompt, base64_image
         )
         break
       except Exception as api_err:
@@ -211,7 +218,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f" {api_err}"
         )
         if attempt < max_retries - 1:
-          await asyncio.sleep(3 * (attempt + 1))
+          await asyncio.sleep(backoff_delays[attempt])
         else:
           raise api_err
 
@@ -268,8 +275,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
   except Exception as e:
-    logging.error(f"Ошибка: {e}")
-    await status_msg.edit_text(f"Произошла ошибка при обработке: {e}")
+    err_str = str(e)
+    logging.error(f"Ошибка при обработке: {err_str}")
+    if "429" in err_str:
+      await status_msg.edit_text(
+          "⏳ Сервер ИИ перегружен запросами (лимит 429). Пожалуйста,"
+          " подождите 15–20 секунд и отправьте фото ещё раз."
+      )
+    else:
+      await status_msg.edit_text(
+          f"Произошла ошибка при обработке: {safe_html(err_str)}"
+      )
 
 
 def main():

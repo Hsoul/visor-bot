@@ -29,7 +29,6 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиента OpenAI с приоритетными заголовками OpenRouter
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
@@ -41,14 +40,19 @@ client = OpenAI(
 
 
 def normalize_phone(phone: str) -> str:
-  """Приводит любой российский номер телефона к строгому стандарту +7 (XXX) XXX-XX-XX
+  """Приводит любой российский номер телефона к стандарту +7 (XXX) XXX-XX-XX.
 
-  и автоматически устраняет галлюцинации/дубли префиксов от ИИ.
+  - Если номер 7-значный (городской СПб) -> автоматически добавляет 7812. -
+  Исправляет дубли префиксов от ИИ.
   """
   if not phone:
     return ""
 
   digits = re.sub(r"\D", "", phone)
+
+  # Если 7 цифр (городской номер СПб) -> превращаем в 11 цифр с кодом 7812
+  if len(digits) == 7:
+    digits = "7812" + digits
 
   # Защита от сдвоенных префиксов
   if len(digits) > 11 and (
@@ -82,7 +86,7 @@ def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
 
 
 def generate_vcard(data: dict, user_note: str = "") -> str:
-  """Формирует чистый vCard (версия 3.0) без аватарок."""
+  """Формирует чистый vCard (версия 3.0)."""
   fn = data.get("full_name", "Неизвестный контакт")
   last_name = data.get("last_name", "")
   first_name = data.get("first_name", "")
@@ -131,56 +135,53 @@ def safe_html(text: str) -> str:
   return html.escape(str(text or "-"))
 
 
-def call_openrouter_api(prompt: str, base64_image: str):
-  """Выполняет синхронный вызов API OpenRouter в изолированном фоновом потоке."""
+def call_openrouter_api(
+    prompt: str, base64_image: str = None, text_content: str = None
+):
+  """Выполняет синхронный вызов API OpenRouter в фоновом потоке (для фото или текста)."""
+  content_payload = [{"type": "text", "text": prompt}]
+
+  if base64_image:
+    content_payload.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+    })
+  elif text_content:
+    content_payload.append(
+        {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
+    )
+
   return client.chat.completions.create(
       model="qwen/qwen2.5-vl-72b-instruct",
-      messages=[{
-          "role": "user",
-          "content": [
-              {"type": "text", "text": prompt},
-              {
-                  "type": "image_url",
-                  "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-              },
-          ],
-      }],
+      messages=[{"role": "user", "content": content_payload}],
       max_tokens=1500,
   )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
-      "Привет, Владимир! Отправь мне фотографию визитки. Вы можете добавить"
-      " подпись к фото с комментарием — я сожму его в заметку и сформирую"
-      " файл контакта .vcf для iPhone!"
+      "Привет, Владимир! Отправь мне фотографию визитки ИЛИ просто скопированный"
+      " текст с контактами. Я сформирую готовый файл контакта .vcf для iPhone!"
   )
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_contact_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    base64_image: str = None,
+    raw_text_input: str = None,
+    user_caption: str = "",
+):
+  """Единый обработчик для распознавания (и изображений, и текста)."""
   status_msg = await update.message.reply_text(
-      "Распознаю визитку и создаю файл контакта..."
+      "Распознаю контактные данные и создаю файл контакта..."
   )
 
   try:
-    if update.message.photo:
-      file_id = update.message.photo[-1].file_id
-    elif update.message.document:
-      file_id = update.message.document.file_id
-    else:
-      await status_msg.edit_text("Пожалуйста, отправьте изображение.")
-      return
-
-    user_caption = update.message.caption or ""
-
-    telegram_file = await context.bot.get_file(file_id)
-    image_bytes = await telegram_file.download_as_bytearray()
-    base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
-
-    prompt = f"""Считай данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
+    prompt = f"""Считай контактные данные и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
 ПРАВИЛА ДЛЯ ТЕЛЕФОНОВ:
-1. Считывай телефонные номера СТРОГО знак в знак по факту текста визитки, не придумывай и не добавляй лишние цифры от себя!
+1. Считывай телефонные номера СТРОГО по факту данных, не придумывай и не добавляй лишние цифры!
 2. В массив "phones" включай все найденные номера.
 
 Структура JSON:
@@ -207,9 +208,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for attempt in range(max_retries):
       try:
-        # Неблокирующий асинхронный вызов через asyncio.to_thread
         response = await asyncio.to_thread(
-            call_openrouter_api, prompt, base64_image
+            call_openrouter_api,
+            prompt,
+            base64_image=base64_image,
+            text_content=raw_text_input,
         )
         break
       except Exception as api_err:
@@ -228,7 +231,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = json.loads(raw_json)
 
-    # Строгая нормализация номеров телефонов
+    # Строгая нормализация номеров телефонов (включая автодобавление 812 для 7-значных)
     raw_phones = data.get("phones", [])
     normalized_phones = [
         normalize_phone(p) for p in raw_phones if normalize_phone(p)
@@ -279,8 +282,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.error(f"Ошибка при обработке: {err_str}")
     if "429" in err_str:
       await status_msg.edit_text(
-          "⏳ Сервер ИИ перегружен запросами (лимит 429). Пожалуйста,"
-          " подождите 15–20 секунд и отправьте фото ещё раз."
+          "⏳ Сервер ИИ перегружен (лимит 429). Подождите 15–20 секунд и"
+          " отправьте запрос ещё раз."
       )
     else:
       await status_msg.edit_text(
@@ -288,11 +291,41 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
       )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  if update.message.photo:
+    file_id = update.message.photo[-1].file_id
+  elif update.message.document:
+    file_id = update.message.document.file_id
+  else:
+    return
+
+  user_caption = update.message.caption or ""
+  telegram_file = await context.bot.get_file(file_id)
+  image_bytes = await telegram_file.download_as_bytearray()
+  base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
+
+  await process_contact_request(
+      update, context, base64_image=base64_image, user_caption=user_caption
+  )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  text_input = update.message.text or ""
+  await process_contact_request(update, context, raw_text_input=text_input)
+
+
 def main():
   app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
   app.add_handler(CommandHandler("start", start))
+
+  # Обработчик изображений (фото и файлы)
   app.add_handler(
       MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+  )
+
+  # Обработчик обычного текста
+  app.add_handler(
+      MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
   )
 
   logging.info("Бот запущен...")

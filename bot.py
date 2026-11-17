@@ -29,7 +29,7 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиента OpenAI с увеличенным таймаутом сетевого соединения
+# Инициализация клиента OpenAI с увеличенным сетевым таймаутом (60 секунд)
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
@@ -42,7 +42,11 @@ client = OpenAI(
 
 
 def normalize_phone(phone: str) -> str:
-    """Приводит любой российский номер телефона к стандарту +7 (XXX) XXX-XX-XX."""
+    """Приводит российский номер телефона к стандарту +7 (XXX) XXX-XX-XX.
+
+    - Если номер 7-значный (городской СПб) -> автоматически добавляет 7812.
+    - Исправляет дубли префиксов.
+    """
     if not phone:
         return ""
 
@@ -70,10 +74,10 @@ def normalize_phone(phone: str) -> str:
 
 
 def convert_image_to_jpeg_base64(image_bytes: bytes, max_size: int = 1024) -> str:
-    """Оптимизирует фото: убирает поворот EXIF, уменьшает размер до 1024px и сжимает JPEG."""
+    """Оптимизирует фото: поворачивает по EXIF, ужимает до 1024px и сжимает JPEG."""
     image = Image.open(io.BytesIO(image_bytes))
-    
-    # Исправление автоматического поворота с iPhone (по EXIF тегам)
+
+    # Корректный поворот ориентации кадра с iPhone
     try:
         image = ImageOps.exif_transpose(image)
     except Exception:
@@ -82,7 +86,7 @@ def convert_image_to_jpeg_base64(image_bytes: bytes, max_size: int = 1024) -> st
     if image.mode != "RGB":
         image = image.convert("RGB")
 
-    # Уменьшение разрешения для мгновенной передачи по сети
+    # Уменьшение разрешения для защиты от сетевых обрывов
     image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
 
     output_buffer = io.BytesIO()
@@ -136,14 +140,14 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
 
 
 def safe_html(text: str) -> str:
-    """Экранирует спецсимволы HTML для защиты разметки Telegram."""
+    """Экранирует спецсимволы HTML для Telegram."""
     return html.escape(str(text or "-"))
 
 
 def call_openrouter_api(
     prompt: str, base64_image: str = None, text_content: str = None
 ):
-    """Каскадный вызов только надёжных Vision-моделей OpenRouter."""
+    """Каскадный вызов надёжных Vision-моделей в OpenRouter."""
     content_payload = [{"type": "text", "text": prompt}]
 
     if base64_image:
@@ -156,12 +160,11 @@ def call_openrouter_api(
             {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
         )
 
-    # Каскад ТОЛЬКО проверенных моделей с поддержкой изображений (Vision)
+    # Список актуальных и проверенных моделей с поддержкой изображений
     candidate_models = [
-        "qwen/qwen-2.5-vl-7b-instruct",
         "google/gemini-2.0-flash-001",
+        "qwen/qwen-2.5-vl-7b-instruct",
         "qwen/qwen-2.5-vl-72b-instruct",
-        "qwen/qwen-2.5-vl-7b-instruct:free",
     ]
 
     last_exception = None
@@ -176,7 +179,7 @@ def call_openrouter_api(
             return response
         except Exception as e:
             logging.warning(
-                f"Ошибка вызова модели {model_id}: {e}. Пробуем следующую модель..."
+                f"Ошибка вызова модели {model_id}: {e}. Переходим к резервной..."
             )
             last_exception = e
 
@@ -203,7 +206,7 @@ async def process_contact_request(
     )
 
     try:
-        prompt = f"""Считай контактные данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
+        prompt = f"""Считай контактные данные и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
 ПРАВИЛА ДЛЯ ТЕЛЕФОНОВ:
 1. Считывай телефонные номера СТРОГО по факту данных, не придумывай и не добавляй лишние цифры!
@@ -314,7 +317,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_file = await context.bot.get_file(file_id)
     image_bytes = await telegram_file.download_as_bytearray()
     
-    # Оптимизируем изображение прямо в памяти перед отправкой
+    # Сжатие и ориентация снимка в памяти перед отправкой
     base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
 
     await process_contact_request(

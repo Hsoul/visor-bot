@@ -29,7 +29,7 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиента OpenAI для работы через OpenRouter
+# Инициализация клиентом OpenAI для работы через OpenRouter
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
@@ -51,11 +51,9 @@ def normalize_phone(phone: str) -> str:
 
     digits = re.sub(r"\D", "", phone)
 
-    # Если 7 цифр (городской номер СПб) -> превращаем в 11 цифр с кодом 7812
     if len(digits) == 7:
         digits = "7812" + digits
 
-    # Защита от сдвоенных префиксов
     if len(digits) > 11 and (
         digits.startswith("7981931") or digits.startswith("8981931")
     ):
@@ -137,7 +135,7 @@ def safe_html(text: str) -> str:
 def call_openrouter_api(
     prompt: str, base64_image: str = None, text_content: str = None
 ):
-    """Синхронный вызов нейросети через OpenRouter."""
+    """Синхронный вызов доступной бесплатной зрячей модели через OpenRouter."""
     content_payload = [{"type": "text", "text": prompt}]
 
     if base64_image:
@@ -150,11 +148,10 @@ def call_openrouter_api(
             {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
         )
 
-    # Используем супер-легкую и быструю модель Gemini Flash 1.5
+    # Актуальная бесплатная нейросеть с поддержкой зрячего распознавания на OpenRouter
     return client.chat.completions.create(
-        model="google/gemini-flash-1.5-8b",
+        model="meta-llama/llama-3.2-11b-vision-instruct:free",
         messages=[{"role": "user", "content": content_payload}],
-        max_tokens=800,
     )
 
 
@@ -231,7 +228,6 @@ async def process_contact_request(
 
         data = json.loads(raw_json)
 
-        # Нормализация телефонных номеров
         raw_phones = data.get("phones", [])
         normalized_phones = [
             normalize_phone(p) for p in raw_phones if normalize_phone(p)
@@ -282,8 +278,7 @@ async def process_contact_request(
         logging.error(f"Ошибка при обработке: {err_str}")
         if "402" in err_str:
             await status_msg.edit_text(
-                "💳 Недостаточно баланса на API-ключе OpenRouter. Пополните"
-                " счет на openrouter.ai."
+                "💳 Закончился лимит на ключи OpenRouter. Зайдите в openrouter.ai и проверьте раздел Keys/Credits."
             )
         elif "429" in err_str:
             await status_msg.edit_text(
@@ -323,12 +318,9 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
 
-    # Обработчик фото и документов
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
     )
-
-    # Обработчик текста
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )

@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from telegram import Update
 from telegram.ext import (
@@ -29,23 +29,20 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиента OpenAI для работы через OpenRouter
+# Инициализация клиента OpenAI с увеличенным таймаутом сетевого соединения
 client = OpenAI(
-    base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)",
+    base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
+    timeout=60.0,
     default_headers={
-        "HTTP-Referer": "[https://amvera.ru](https://amvera.ru)",
+        "HTTP-Referer": "https://amvera.ru",
         "X-Title": "VisorJamBot",
     },
 )
 
 
 def normalize_phone(phone: str) -> str:
-    """Приводит любой российский номер телефона к стандарту +7 (XXX) XXX-XX-XX.
-
-    - Если номер 7-значный (городской СПб) -> автоматически добавляет 7812.
-    - Исправляет возможные дубли префиксов.
-    """
+    """Приводит любой российский номер телефона к стандарту +7 (XXX) XXX-XX-XX."""
     if not phone:
         return ""
 
@@ -67,18 +64,29 @@ def normalize_phone(phone: str) -> str:
         digits = "7" + digits[-10:]
 
     if len(digits) == 11 and digits.startswith("7"):
-        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits}"
+        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
 
     return f"+{digits}" if digits else phone
 
 
-def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
-    """Конвертирует входное изображение в JPEG и переводит в Base64."""
+def convert_image_to_jpeg_base64(image_bytes: bytes, max_size: int = 1024) -> str:
+    """Оптимизирует фото: убирает поворот EXIF, уменьшает размер до 1024px и сжимает JPEG."""
     image = Image.open(io.BytesIO(image_bytes))
+    
+    # Исправление автоматического поворота с iPhone (по EXIF тегам)
+    try:
+        image = ImageOps.exif_transpose(image)
+    except Exception:
+        pass
+
     if image.mode != "RGB":
         image = image.convert("RGB")
+
+    # Уменьшение разрешения для мгновенной передачи по сети
+    image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
     output_buffer = io.BytesIO()
-    image.save(output_buffer, format="JPEG", quality=95)
+    image.save(output_buffer, format="JPEG", quality=85, optimize=True)
     return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
 
 
@@ -135,11 +143,7 @@ def safe_html(text: str) -> str:
 def call_openrouter_api(
     prompt: str, base64_image: str = None, text_content: str = None
 ):
-    """Каскадный вызов нейросетей через OpenRouter.
-
-    Автоматически перебирает модели из списка, если текущая недоступна или
-    выдает 404.
-    """
+    """Каскадный вызов только надёжных Vision-моделей OpenRouter."""
     content_payload = [{"type": "text", "text": prompt}]
 
     if base64_image:
@@ -152,26 +156,27 @@ def call_openrouter_api(
             {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
         )
 
-    # Динамический каскад роутеров и резервных моделей
+    # Каскад ТОЛЬКО проверенных моделей с поддержкой изображений (Vision)
     candidate_models = [
-        "openrouter/free",
-        "openrouter/auto",
-        "qwen/qwen-2.5-vl-72b-instruct:free",
-        "google/gemini-2.0-flash-exp:free",
+        "qwen/qwen-2.5-vl-7b-instruct",
+        "google/gemini-2.0-flash-001",
         "qwen/qwen-2.5-vl-72b-instruct",
+        "qwen/qwen-2.5-vl-7b-instruct:free",
     ]
 
     last_exception = None
     for model_id in candidate_models:
         try:
-            logging.info(f"Запрос к OpenRouter с моделью: {model_id}")
-            return client.chat.completions.create(
+            logging.info(f"Отправка запроса в OpenRouter (модель: {model_id})...")
+            response = client.chat.completions.create(
                 model=model_id,
                 messages=[{"role": "user", "content": content_payload}],
             )
+            logging.info(f"Успешный ответ от модели: {model_id}")
+            return response
         except Exception as e:
             logging.warning(
-                f"Модель {model_id} недоступна ({e}). Переходим к следующей..."
+                f"Ошибка вызова модели {model_id}: {e}. Пробуем следующую модель..."
             )
             last_exception = e
 
@@ -198,7 +203,7 @@ async def process_contact_request(
     )
 
     try:
-        prompt = f"""Считай контактные данные и верни СТРОГО чистый JSON без разметки markdown (без ```json).
+        prompt = f"""Считай контактные данные с визитки и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
 ПРАВИЛА ДЛЯ ТЕЛЕФОНОВ:
 1. Считывай телефонные номера СТРОГО по факту данных, не придумывай и не добавляй лишние цифры!
@@ -285,7 +290,7 @@ async def process_contact_request(
         logging.error(f"Ошибка при обработке: {err_str}")
         if "402" in err_str:
             await status_msg.edit_text(
-                "💳 Закончился лимит на ключи OpenRouter. Зайдите в openrouter.ai и пополните счет."
+                "💳 Закончился лимит на балансе OpenRouter. Пополните счет на openrouter.ai."
             )
         elif "429" in err_str:
             await status_msg.edit_text(
@@ -308,6 +313,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_caption = update.message.caption or ""
     telegram_file = await context.bot.get_file(file_id)
     image_bytes = await telegram_file.download_as_bytearray()
+    
+    # Оптимизируем изображение прямо в памяти перед отправкой
     base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
 
     await process_contact_request(

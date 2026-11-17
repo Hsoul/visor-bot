@@ -18,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 
-# Поддержка HEIC с iPhone
+# Поддержка HEIC формата с iPhone
 register_heif_opener()
 
 logging.basicConfig(
@@ -29,7 +29,7 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиентом OpenAI через шлюз OpenRouter
+# Инициализация клиента OpenAI для работы через OpenRouter
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
@@ -44,7 +44,7 @@ def normalize_phone(phone: str) -> str:
     """Приводит любой российский номер телефона к стандарту +7 (XXX) XXX-XX-XX.
 
     - Если номер 7-значный (городской СПб) -> автоматически добавляет 7812.
-    - Исправляет дубли префиксов от ИИ.
+    - Исправляет возможные дубли префиксов.
     """
     if not phone:
         return ""
@@ -75,7 +75,7 @@ def normalize_phone(phone: str) -> str:
 
 
 def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
-    """Конвертирует входной файл в JPEG и переводит в Base64."""
+    """Конвертирует входное изображение в JPEG и переводит в Base64."""
     image = Image.open(io.BytesIO(image_bytes))
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -85,7 +85,7 @@ def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
 
 
 def generate_vcard(data: dict, user_note: str = "") -> str:
-    """Формирует чистый vCard (версия 3.0)."""
+    """Формирует vCard контакта (версия 3.0) для сохранения в iPhone."""
     fn = data.get("full_name", "Неизвестный контакт")
     last_name = data.get("last_name", "")
     first_name = data.get("first_name", "")
@@ -130,14 +130,14 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
 
 
 def safe_html(text: str) -> str:
-    """Экранирует спецсимволы HTML для защиты Telegram-разметки."""
+    """Экранирует спецсимволы HTML для защиты разметки Telegram."""
     return html.escape(str(text or "-"))
 
 
 def call_openrouter_api(
     prompt: str, base64_image: str = None, text_content: str = None
 ):
-    """Выполняет синхронный вызов API OpenRouter с оптимальным лимитом токенов."""
+    """Синхронный вызов нейросети через OpenRouter."""
     content_payload = [{"type": "text", "text": prompt}]
 
     if base64_image:
@@ -150,9 +150,9 @@ def call_openrouter_api(
             {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
         )
 
-    # Оптимизировано: max_tokens=800 экономит баланс и предотвращает ошибку 402
+    # Используем супер-легкую и быструю модель Gemini Flash 1.5
     return client.chat.completions.create(
-        model="qwen/qwen2.5-vl-72b-instruct",
+        model="google/gemini-flash-1.5-8b",
         messages=[{"role": "user", "content": content_payload}],
         max_tokens=800,
     )
@@ -172,7 +172,7 @@ async def process_contact_request(
     raw_text_input: str = None,
     user_caption: str = "",
 ):
-    """Единый обработчик для распознавания (и изображений, и текста)."""
+    """Единый обработчик распознавания визитки."""
     status_msg = await update.message.reply_text(
         "Распознаю контактные данные и создаю файл контакта..."
     )
@@ -204,7 +204,7 @@ async def process_contact_request(
 
         response = None
         max_retries = 3
-        backoff_delays = [2, 5, 10]
+        backoff_delays = [2, 4, 8]
 
         for attempt in range(max_retries):
             try:
@@ -231,7 +231,7 @@ async def process_contact_request(
 
         data = json.loads(raw_json)
 
-        # Строгая нормализация номеров телефонов
+        # Нормализация телефонных номеров
         raw_phones = data.get("phones", [])
         normalized_phones = [
             normalize_phone(p) for p in raw_phones if normalize_phone(p)
@@ -282,13 +282,13 @@ async def process_contact_request(
         logging.error(f"Ошибка при обработке: {err_str}")
         if "402" in err_str:
             await status_msg.edit_text(
-                "💳 Достигнут временный лимит API. Обновите страницу или повторите"
-                " отправку через пару минут."
+                "💳 Недостаточно баланса на API-ключе OpenRouter. Пополните"
+                " счет на openrouter.ai."
             )
         elif "429" in err_str:
             await status_msg.edit_text(
-                "⏳ Сервер ИИ перегружен (лимит 429). Подождите 15–20 секунд и"
-                " отправьте запрос ещё раз."
+                "⏳ Сервер перегружен. Подождите 10 секунд и отправьте визитку"
+                " еще раз."
             )
         else:
             await status_msg.edit_text(
@@ -323,12 +323,12 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
 
-    # Обработчик изображений (фото и файлы)
+    # Обработчик фото и документов
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
     )
 
-    # Обработчик обычного текста
+    # Обработчик текста
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )

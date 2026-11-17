@@ -29,12 +29,12 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиентом OpenAI для работы через OpenRouter
+# Инициализация клиента OpenAI для работы через OpenRouter
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
+    base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)",
     api_key=OPENROUTER_API_KEY,
     default_headers={
-        "HTTP-Referer": "https://amvera.ru",
+        "HTTP-Referer": "[https://amvera.ru](https://amvera.ru)",
         "X-Title": "VisorJamBot",
     },
 )
@@ -67,7 +67,7 @@ def normalize_phone(phone: str) -> str:
         digits = "7" + digits[-10:]
 
     if len(digits) == 11 and digits.startswith("7"):
-        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits}"
 
     return f"+{digits}" if digits else phone
 
@@ -135,7 +135,11 @@ def safe_html(text: str) -> str:
 def call_openrouter_api(
     prompt: str, base64_image: str = None, text_content: str = None
 ):
-    """Синхронный вызов доступной бесплатной зрячей модели через OpenRouter."""
+    """Каскадный вызов нейросетей через OpenRouter.
+
+    Автоматически перебирает модели из списка, если текущая недоступна или
+    выдает 404.
+    """
     content_payload = [{"type": "text", "text": prompt}]
 
     if base64_image:
@@ -148,11 +152,30 @@ def call_openrouter_api(
             {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
         )
 
-    # Актуальная бесплатная нейросеть с поддержкой зрячего распознавания на OpenRouter
-    return client.chat.completions.create(
-        model="meta-llama/llama-3.2-11b-vision-instruct:free",
-        messages=[{"role": "user", "content": content_payload}],
-    )
+    # Динамический каскад роутеров и резервных моделей
+    candidate_models = [
+        "openrouter/free",
+        "openrouter/auto",
+        "qwen/qwen-2.5-vl-72b-instruct:free",
+        "google/gemini-2.0-flash-exp:free",
+        "qwen/qwen-2.5-vl-72b-instruct",
+    ]
+
+    last_exception = None
+    for model_id in candidate_models:
+        try:
+            logging.info(f"Запрос к OpenRouter с моделью: {model_id}")
+            return client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": content_payload}],
+            )
+        except Exception as e:
+            logging.warning(
+                f"Модель {model_id} недоступна ({e}). Переходим к следующей..."
+            )
+            last_exception = e
+
+    raise last_exception
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,28 +222,12 @@ async def process_contact_request(
 Комментарий пользователя: "{user_caption}"
 """
 
-        response = None
-        max_retries = 3
-        backoff_delays = [2, 4, 8]
-
-        for attempt in range(max_retries):
-            try:
-                response = await asyncio.to_thread(
-                    call_openrouter_api,
-                    prompt,
-                    base64_image=base64_image,
-                    text_content=raw_text_input,
-                )
-                break
-            except Exception as api_err:
-                logging.warning(
-                    f"Попытка {attempt + 1}/{max_retries} завершилась с ошибкой:"
-                    f" {api_err}"
-                )
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(backoff_delays[attempt])
-                else:
-                    raise api_err
+        response = await asyncio.to_thread(
+            call_openrouter_api,
+            prompt,
+            base64_image=base64_image,
+            text_content=raw_text_input,
+        )
 
         raw_json = response.choices[0].message.content.strip()
         raw_json = re.sub(r"^```json\s*", "", raw_json)
@@ -278,12 +285,11 @@ async def process_contact_request(
         logging.error(f"Ошибка при обработке: {err_str}")
         if "402" in err_str:
             await status_msg.edit_text(
-                "💳 Закончился лимит на ключи OpenRouter. Зайдите в openrouter.ai и проверьте раздел Keys/Credits."
+                "💳 Закончился лимит на ключи OpenRouter. Зайдите в openrouter.ai и пополните счет."
             )
         elif "429" in err_str:
             await status_msg.edit_text(
-                "⏳ Сервер перегружен. Подождите 10 секунд и отправьте визитку"
-                " еще раз."
+                "⏳ Сервер перегружен. Подождите 10 секунд и отправьте визитку еще раз."
             )
         else:
             await status_msg.edit_text(

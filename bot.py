@@ -22,7 +22,7 @@ from telegram.ext import (
 register_heif_opener()
 
 # Метка версии приложения
-BOT_VERSION = "3.5"
+BOT_VERSION = "3.6"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,27 +43,33 @@ client = OpenAI(
 
 
 def normalize_phone(phone: str) -> str:
-    """Приводит российский номер телефона к стандарту +7 (XXX) XXX-XX-XX."""
+    """
+    Приводит любой российский номер к стандарту: +7 (XXX) XXX-XX-XX
+    - 7 цифр (городской СПб) -> добавляет 812 -> +7 (812) XXX-XX-XX
+    - 10 цифр (без 7/8) -> добавляет 7 -> +7 (XXX) XXX-XX-XX
+    - 11 цифр (начиная с 7 или 8) -> +7 (XXX) XXX-XX-XX
+    - Защита от дублирования хвоста номера.
+    """
     if not phone:
         return ""
 
-    digits = re.sub(r"\D", "", phone)
+    # Извлекаем только цифры
+    digits = re.sub(r"\D", "", str(phone))
 
+    # Если 7 цифр (городской номер СПб), добавляем код 7812
     if len(digits) == 7:
         digits = "7812" + digits
-
-    if len(digits) > 11 and (
-        digits.startswith("7981931") or digits.startswith("8981931")
-    ):
-        digits = "7931" + digits[7:]
-
-    if len(digits) == 10:
+    # Если 10 цифр (например, 9119264455), добавляем 7
+    elif len(digits) == 10:
         digits = "7" + digits
+    # Если 11 цифр и начинается с 8 (например, 89119264455)
     elif len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
+    # Если затесался дубликат или сдвоенный номер (больше 11 цифр), берем последние 10 цифр и ставим 7
     elif len(digits) > 11:
         digits = "7" + digits[-10:]
 
+    # Проверяем, что получилось ровно 11 цифр и начинается с 7
     if len(digits) == 11 and digits.startswith("7"):
         return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits}"
 
@@ -109,7 +115,11 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
     for phone in phones:
         norm_p = normalize_phone(phone)
         if norm_p:
-            vcard_lines.append(f"TEL;TYPE=CELL:{norm_p}")
+            # Городские (812) помечаем как WORK, мобильные (9xx) как CELL
+            if "(812)" in norm_p:
+                vcard_lines.append(f"TEL;TYPE=WORK,VOICE:{norm_p}")
+            else:
+                vcard_lines.append(f"TEL;TYPE=CELL,VOICE:{norm_p}")
 
     if email:
         vcard_lines.append(f"EMAIL:{email}")
@@ -197,8 +207,7 @@ async def process_contact_request(
         prompt = f"""Считай контактные данные и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
 ПРАВИЛА ДЛЯ ТЕЛЕФОНОВ:
-1. Считывай телефонные номера СТРОГО по факту данных, не придумывай и не добавляй лишние цифры!
-2. В массив "phones" включай все найденные номера.
+1. В массив "phones" передавай номера ровно в том виде, в каком они написаны на визитке, либо очищенные цифры. Не склеивай несколько номеров в один!
 
 Структура JSON:
 {{
@@ -232,9 +241,12 @@ async def process_contact_request(
         data = json.loads(raw_json)
 
         raw_phones = data.get("phones", [])
-        normalized_phones = [
-            normalize_phone(p) for p in raw_phones if normalize_phone(p)
-        ]
+        normalized_phones = []
+        for p in raw_phones:
+            norm = normalize_phone(p)
+            if norm and norm not in normalized_phones:
+                normalized_phones.append(norm)
+
         data["phones"] = normalized_phones
 
         phones_str = (

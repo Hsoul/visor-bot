@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from openai import OpenAI
-from PIL import Image, ImageOps
+from PIL import Image
 from pillow_heif import register_heif_opener
 from telegram import Update
 from telegram.ext import (
@@ -21,32 +21,29 @@ from telegram.ext import (
 # Поддержка HEIC формата с iPhone
 register_heif_opener()
 
+# Метка версии приложения
+BOT_VERSION = "3.5"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Инициализация клиента OpenAI с увеличенным сетевым таймаутом (60 секунд)
+# Получение настроек API шлюза (ProxyAPI / VseGPT / OpenAI-compatible)
+API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+BASE_URL = os.getenv("AI_BASE_URL", "[https://api.proxyapi.ru/openai/v1](https://api.proxyapi.ru/openai/v1)")
+
+# Инициализация клиента OpenAI для работы с выбранным шлюзом
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    timeout=60.0,
-    default_headers={
-        "HTTP-Referer": "https://amvera.ru",
-        "X-Title": "VisorJamBot",
-    },
+    base_url=BASE_URL,
+    api_key=API_KEY,
 )
 
 
 def normalize_phone(phone: str) -> str:
-    """Приводит российский номер телефона к стандарту +7 (XXX) XXX-XX-XX.
-
-    - Если номер 7-значный (городской СПб) -> автоматически добавляет 7812.
-    - Исправляет дубли префиксов.
-    """
+    """Приводит российский номер телефона к стандарту +7 (XXX) XXX-XX-XX."""
     if not phone:
         return ""
 
@@ -68,29 +65,18 @@ def normalize_phone(phone: str) -> str:
         digits = "7" + digits[-10:]
 
     if len(digits) == 11 and digits.startswith("7"):
-        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits}"
 
     return f"+{digits}" if digits else phone
 
 
-def convert_image_to_jpeg_base64(image_bytes: bytes, max_size: int = 1024) -> str:
-    """Оптимизирует фото: поворачивает по EXIF, ужимает до 1024px и сжимает JPEG."""
+def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
+    """Конвертирует входное изображение в JPEG и переводит в Base64."""
     image = Image.open(io.BytesIO(image_bytes))
-
-    # Корректный поворот ориентации кадра с iPhone
-    try:
-        image = ImageOps.exif_transpose(image)
-    except Exception:
-        pass
-
     if image.mode != "RGB":
         image = image.convert("RGB")
-
-    # Уменьшение разрешения для защиты от сетевых обрывов
-    image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-
     output_buffer = io.BytesIO()
-    image.save(output_buffer, format="JPEG", quality=85, optimize=True)
+    image.save(output_buffer, format="JPEG", quality=95)
     return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
 
 
@@ -140,14 +126,14 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
 
 
 def safe_html(text: str) -> str:
-    """Экранирует спецсимволы HTML для Telegram."""
+    """Экранирует спецсимволы HTML для защиты разметки Telegram."""
     return html.escape(str(text or "-"))
 
 
-def call_openrouter_api(
+def call_vision_api(
     prompt: str, base64_image: str = None, text_content: str = None
 ):
-    """Каскадный вызов надёжных Vision-моделей в OpenRouter."""
+    """Вызов Vision-модели с поддержкой резервных вариантов моделей."""
     content_payload = [{"type": "text", "text": prompt}]
 
     if base64_image:
@@ -160,36 +146,38 @@ def call_openrouter_api(
             {"type": "text", "text": f"\n\nТЕКСТ ДЛЯ РАЗБОРА:\n{text_content}"}
         )
 
-    # Список актуальных и проверенных моделей с поддержкой изображений
-    candidate_models = [
+    # Список наиболее надёжных Vision моделей для ProxyAPI
+    models_to_try = [
+        "gemini-2.0-flash",
+        "gpt-4o-mini",
         "google/gemini-2.0-flash-001",
-        "qwen/qwen-2.5-vl-7b-instruct",
-        "qwen/qwen-2.5-vl-72b-instruct",
     ]
 
-    last_exception = None
-    for model_id in candidate_models:
+    last_err = None
+    for model_id in models_to_try:
         try:
-            logging.info(f"Отправка запроса в OpenRouter (модель: {model_id})...")
-            response = client.chat.completions.create(
+            logging.info(
+                f"[v{BOT_VERSION}] Запрос к API ({BASE_URL}) модель: {model_id}"
+            )
+            return client.chat.completions.create(
                 model=model_id,
                 messages=[{"role": "user", "content": content_payload}],
             )
-            logging.info(f"Успешный ответ от модели: {model_id}")
-            return response
         except Exception as e:
             logging.warning(
-                f"Ошибка вызова модели {model_id}: {e}. Переходим к резервной..."
+                f"[v{BOT_VERSION}] Ошибка модели {model_id}: {e}. Пробуем"
+                " следующую..."
             )
-            last_exception = e
+            last_err = e
 
-    raise last_exception
+    raise last_err
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет, Владимир! Отправь мне фотографию визитки ИЛИ просто скопированный"
-        " текст с контактами. Я сформирую готовый файл контакта .vcf для iPhone!"
+        f"🤖 Visor Jam Bot (Версия {BOT_VERSION}) готов к работе!\n\n"
+        "Отправь мне фотографию визитки ИЛИ скопированный текст с контактами. "
+        "Я сформирую готовый файл контакта .vcf для iPhone!"
     )
 
 
@@ -202,7 +190,7 @@ async def process_contact_request(
 ):
     """Единый обработчик распознавания визитки."""
     status_msg = await update.message.reply_text(
-        "Распознаю контактные данные и создаю файл контакта..."
+        f"⚙️ [v{BOT_VERSION}] Распознаю контактные данные..."
     )
 
     try:
@@ -231,7 +219,7 @@ async def process_contact_request(
 """
 
         response = await asyncio.to_thread(
-            call_openrouter_api,
+            call_vision_api,
             prompt,
             base64_image=base64_image,
             text_content=raw_text_input,
@@ -290,19 +278,11 @@ async def process_contact_request(
 
     except Exception as e:
         err_str = str(e)
-        logging.error(f"Ошибка при обработке: {err_str}")
-        if "402" in err_str:
-            await status_msg.edit_text(
-                "💳 Закончился лимит на балансе OpenRouter. Пополните счет на openrouter.ai."
-            )
-        elif "429" in err_str:
-            await status_msg.edit_text(
-                "⏳ Сервер перегружен. Подождите 10 секунд и отправьте визитку еще раз."
-            )
-        else:
-            await status_msg.edit_text(
-                f"Произошла ошибка при обработке: {safe_html(err_str)}"
-            )
+        logging.error(f"[v{BOT_VERSION}] Ошибка при обработке: {err_str}")
+        await status_msg.edit_text(
+            f"Произошла ошибка при обработке (Версия {BOT_VERSION}):"
+            f" {safe_html(err_str)}"
+        )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,8 +296,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_caption = update.message.caption or ""
     telegram_file = await context.bot.get_file(file_id)
     image_bytes = await telegram_file.download_as_bytearray()
-    
-    # Сжатие и ориентация снимка в памяти перед отправкой
     base64_image = convert_image_to_jpeg_base64(bytes(image_bytes))
 
     await process_contact_request(
@@ -341,7 +319,7 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    logging.info("Бот запущен...")
+    logging.info(f"Бот версии {BOT_VERSION} запущен...")
     app.run_polling()
 
 

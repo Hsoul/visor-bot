@@ -22,7 +22,7 @@ from telegram.ext import (
 register_heif_opener()
 
 # Метка версии приложения
-BOT_VERSION = "3.6"
+BOT_VERSION = "3.7"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -33,7 +33,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Получение настроек API шлюза (ProxyAPI / VseGPT / OpenAI-compatible)
 API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-BASE_URL = os.getenv("AI_BASE_URL", "[https://api.proxyapi.ru/openai/v1](https://api.proxyapi.ru/openai/v1)")
+BASE_URL = os.getenv("AI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
 
 # Инициализация клиента OpenAI для работы с выбранным шлюзом
 client = OpenAI(
@@ -44,7 +44,7 @@ client = OpenAI(
 
 def normalize_phone(phone: str) -> str:
     """
-    Приводит любой российский номер к стандарту: +7 (XXX) XXX-XX-XX
+    Приводит любой российский номер к идеальному стандарту: +7 (XXX) XXX-XX-XX
     - 7 цифр (городской СПб) -> добавляет 812 -> +7 (812) XXX-XX-XX
     - 10 цифр (без 7/8) -> добавляет 7 -> +7 (XXX) XXX-XX-XX
     - 11 цифр (начиная с 7 или 8) -> +7 (XXX) XXX-XX-XX
@@ -56,6 +56,9 @@ def normalize_phone(phone: str) -> str:
     # Извлекаем только цифры
     digits = re.sub(r"\D", "", str(phone))
 
+    if not digits:
+        return ""
+
     # Если 7 цифр (городской номер СПб), добавляем код 7812
     if len(digits) == 7:
         digits = "7812" + digits
@@ -65,15 +68,39 @@ def normalize_phone(phone: str) -> str:
     # Если 11 цифр и начинается с 8 (например, 89119264455)
     elif len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
-    # Если затесался дубликат или сдвоенный номер (больше 11 цифр), берем последние 10 цифр и ставим 7
+    # Если затесался дубликат или сдвоенный номер (больше 11 цифр), берем строго последние 10 цифр и приставляем 7
     elif len(digits) > 11:
         digits = "7" + digits[-10:]
 
     # Проверяем, что получилось ровно 11 цифр и начинается с 7
     if len(digits) == 11 and digits.startswith("7"):
-        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits}"
+        area = digits[1:4]
+        prefix = digits[4:7]
+        line1 = digits[7:9]
+        line2 = digits[9:11]
+        return f"+7 ({area}) {prefix}-{line1}-{line2}"
 
-    return f"+{digits}" if digits else phone
+    return f"+{digits}"
+
+
+def parse_and_normalize_phones(raw_phones) -> list:
+    """Извлекает и нормализует все телефоны, разделяя склеенные строки."""
+    if not raw_phones:
+        return []
+    if isinstance(raw_phones, str):
+        raw_phones = [raw_phones]
+
+    normalized = []
+    for item in raw_phones:
+        if not item:
+            continue
+        # Разделяем по запятым, слэшам и переносам, если нейросеть прислала несколько номеров в одной строке
+        sub_items = re.split(r"[,;\n/]", str(item))
+        for sub in sub_items:
+            norm = normalize_phone(sub)
+            if norm and norm not in normalized:
+                normalized.append(norm)
+    return normalized
 
 
 def convert_image_to_jpeg_base64(image_bytes: bytes) -> str:
@@ -113,13 +140,12 @@ def generate_vcard(data: dict, user_note: str = "") -> str:
         vcard_lines.append(f"TITLE:{title}")
 
     for phone in phones:
-        norm_p = normalize_phone(phone)
-        if norm_p:
+        if phone:
             # Городские (812) помечаем как WORK, мобильные (9xx) как CELL
-            if "(812)" in norm_p:
-                vcard_lines.append(f"TEL;TYPE=WORK,VOICE:{norm_p}")
+            if "(812)" in phone:
+                vcard_lines.append(f"TEL;TYPE=WORK,VOICE:{phone}")
             else:
-                vcard_lines.append(f"TEL;TYPE=CELL,VOICE:{norm_p}")
+                vcard_lines.append(f"TEL;TYPE=CELL,VOICE:{phone}")
 
     if email:
         vcard_lines.append(f"EMAIL:{email}")
@@ -200,14 +226,14 @@ async def process_contact_request(
 ):
     """Единый обработчик распознавания визитки."""
     status_msg = await update.message.reply_text(
-        f"⚙️ [v{BOT_VERSION}] Распознаю контактные данные..."
+        f"⚙️ [v{BOT_VERSION}] Немного магии и готово..."
     )
 
     try:
         prompt = f"""Считай контактные данные и верни СТРОГО чистый JSON без разметки markdown (без ```json).
 
 ПРАВИЛА ДЛЯ ТЕЛЕФОНОВ:
-1. В массив "phones" передавай номера ровно в том виде, в каком они написаны на визитке, либо очищенные цифры. Не склеивай несколько номеров в один!
+1. В массив "phones" передавай найденные телефонные номера. Каждый номер отдельным элементом массива!
 
 Структура JSON:
 {{
@@ -240,13 +266,9 @@ async def process_contact_request(
 
         data = json.loads(raw_json)
 
+        # Полная нормализация телефонов
         raw_phones = data.get("phones", [])
-        normalized_phones = []
-        for p in raw_phones:
-            norm = normalize_phone(p)
-            if norm and norm not in normalized_phones:
-                normalized_phones.append(norm)
-
+        normalized_phones = parse_and_normalize_phones(raw_phones)
         data["phones"] = normalized_phones
 
         phones_str = (
